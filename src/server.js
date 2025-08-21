@@ -1,10 +1,10 @@
-// server.js (atualizado: Socket.IO usando salas + sem Map)
+// server.js (Corrigido para o deploy)
 const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
 const jwt = require('jsonwebtoken');
 const dotenv = require('dotenv');
-const ngrok = require('ngrok');
+// A linha 'const ngrok = require('ngrok');' foi REMOVIDA daqui.
 
 const http = require('http');
 const { Server } = require('socket.io');
@@ -24,10 +24,6 @@ const couponRoutes = require('./routes/coupons');
 const app = express();
 const httpServer = http.createServer(app);
 
-// --- MODIFICAÇÃO PRINCIPAL ---
-// A origem do frontend agora é lida da variável de ambiente.
-// Em produção, será 'https://cyberregistro.com.br'.
-// Em desenvolvimento, será 'http://localhost:8080'.
 const FRONTEND_ORIGIN = process.env.FRONTEND_ORIGIN || 'http://localhost:8080';
 const NODE_ENV = process.env.NODE_ENV || 'development';
 
@@ -106,9 +102,10 @@ async function start() {
     httpServer.listen(PORT, async () => {
       console.log(`[API] ✅ Backend: Iniciado com sucesso na porta ${PORT}`);
 
-      // --- MODIFICAÇÃO PRINCIPAL ---
-      // O ngrok só será iniciado se o ambiente NÃO for de produção.
       if (NODE_ENV === 'development') {
+        // --- MODIFICAÇÃO PRINCIPAL ---
+        // O ngrok agora é carregado APENAS em ambiente de desenvolvimento.
+        const ngrok = require('ngrok');
         try {
           const url = await ngrok.connect({
             addr: PORT,
