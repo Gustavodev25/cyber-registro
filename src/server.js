@@ -24,7 +24,12 @@ const couponRoutes = require('./routes/coupons');
 const app = express();
 const httpServer = http.createServer(app);
 
+// --- MODIFICAÇÃO PRINCIPAL ---
+// A origem do frontend agora é lida da variável de ambiente.
+// Em produção, será 'https://cyberregistro.com.br'.
+// Em desenvolvimento, será 'http://localhost:8080'.
 const FRONTEND_ORIGIN = process.env.FRONTEND_ORIGIN || 'http://localhost:8080';
+const NODE_ENV = process.env.NODE_ENV || 'development';
 
 const io = new Server(httpServer, {
   cors: {
@@ -36,7 +41,6 @@ const io = new Server(httpServer, {
 io.on('connection', (socket) => {
   console.log(`[SOCKET] ✅ Cliente conectado: ${socket.id}`);
 
-  // Cliente pede para observar um pagamento: entra em uma SALA por paymentId
   socket.on('watch_payment', (paymentId) => {
     if (paymentId) {
       socket.join(`pay:${paymentId}`);
@@ -65,7 +69,6 @@ app.use(
   })
 );
 
-// Injeta apenas o io (não usamos mais Map de watchers)
 app.use((req, res, next) => {
   req.io = io;
   next();
@@ -93,7 +96,6 @@ app.get('/api/me', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-const NODE_ENV = process.env.NODE_ENV || 'development';
 
 async function start() {
   try {
@@ -101,21 +103,11 @@ async function start() {
     console.log('[API] ✅ Database: Conexão estabelecida.');
     await sequelize.sync({ alter: NODE_ENV === 'development' });
 
-    const [, created] = await User.findOrCreate({
-      where: { email: 'teste@teste.com' },
-      defaults: {
-        nomeCompleto: 'Usuário de Teste',
-        cpf: '000.000.000-00',
-        celular: '(00) 00000-0000',
-        password: '123',
-      },
-      logging: false,
-    });
-    if (created) console.log('[API] ℹ️ Usuário de teste criado.');
-
     httpServer.listen(PORT, async () => {
-      console.log(`[API] ✅ Backend: Iniciado com sucesso em http://localhost:${PORT}`);
+      console.log(`[API] ✅ Backend: Iniciado com sucesso na porta ${PORT}`);
 
+      // --- MODIFICAÇÃO PRINCIPAL ---
+      // O ngrok só será iniciado se o ambiente NÃO for de produção.
       if (NODE_ENV === 'development') {
         try {
           const url = await ngrok.connect({
