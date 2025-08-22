@@ -1,90 +1,170 @@
+// services/asaas.js
 const axios = require('axios');
 
-// =================== INÍCIO DA CORREÇÃO ===================
-// A importação e configuração do 'dotenv' foram removidas deste arquivo.
-// A configuração agora é centralizada no 'server.js' para evitar
-// inconsistências e garantir que as variáveis corretas sejam carregadas.
-// =================== FIM DA CORREÇÃO ===================
+/**
+ * Ambientes e chaves:
+ * - Defina ASAAS_API_KEY_PRODUCTION e ASAAS_API_KEY_SANDBOX nas variáveis de ambiente.
+ * - Se só existir ASAAS_API_KEY, ela será usada como fallback para ambos (não recomendado).
+ */
+const ENVIRONMENTS = {
+  sandbox: {
+    baseURL: 'https://api-sandbox.asaas.com/v3',
+    apiKey: process.env.ASAAS_API_KEY_SANDBOX || process.env.ASAAS_API_KEY || '',
+  },
+  production: {
+    baseURL: 'https://api.asaas.com/v3',
+    apiKey: process.env.ASAAS_API_KEY_PRODUCTION || process.env.ASAAS_API_KEY || '',
+  },
+};
 
-const ASAAS_API_KEY = process.env.ASAAS_API_KEY;
-const ASAAS_ENV = process.env.ASAAS_ENV || 'sandbox';
+/**
+ * Resolve o ambiente a partir do request.
+ * Regras:
+ * - Header opcional: x-asaas-env: 'sandbox'|'production' (força)
+ * - Se origin/host tiver cyberregistro.com.br ou onrender.com → production
+ * - Se NODE_ENV === 'production' e não houver origin/host → production
+ * - Caso contrário → sandbox
+ */
+function resolveEnvFromReq(req) {
+  const forced = (req.headers['x-asaas-env'] || '').toString().trim().toLowerCase();
+  if (forced === 'sandbox' || forced === 'production') return forced;
 
-// Adicionada uma verificação para garantir que a chave da API foi carregada
-if (!ASAAS_API_KEY) {
-  console.error('[ASAAS] ❌ ERRO CRÍTICO: A variável de ambiente ASAAS_API_KEY não foi definida.');
-  throw new Error('A chave da API do Asaas não está configurada.');
+  const origin = (req.headers.origin || '').toLowerCase();
+  const host = (req.headers.host || '').toLowerCase();
+
+  const isProdDomain =
+    /cyberregistro\.com\.br/.test(origin) ||
+    /cyberregistro\.com\.br/.test(host) ||
+    /onrender\.com$/.test(origin) ||
+    /onrender\.com$/.test(host);
+
+  if (isProdDomain) return 'production';
+  if (process.env.NODE_ENV === 'production' && !origin && !host) return 'production';
+  return 'sandbox';
 }
 
-const environments = {
-  sandbox: 'https://api-sandbox.asaas.com/v3',
-  production: 'https://api.asaas.com/v3',
-};
-
-const api = axios.create({
-  baseURL: environments[ASAAS_ENV],
-  headers: {
-    'Content-Type': 'application/json',
-    'access_token': ASAAS_API_KEY,
-  },
-});
-
-const createCustomer = async (user) => {
-  try {
-    const payload = {
-      name: user.nomeCompleto,
-      email: user.email,
-      cpfCnpj: String(user.cpf || '').replace(/\D/g, ''),
-      mobilePhone: String(user.celular || '').replace(/\D/g, ''),
-      address: user.logradouro || undefined,
-      addressNumber: user.numero || undefined,
-      complement: user.complemento || undefined,
-      province: user.bairro || undefined,
-      postalCode: String(user.cep || '').replace(/\D/g, ''),
-    };
-    const response = await api.post('/customers', payload);
-    return response.data.id;
-  } catch (error) {
-    console.error('Erro ao criar cliente no Asaas:', error.response?.data || error.message);
-    throw new Error('Falha ao registrar cliente no gateway de pagamento.');
+function buildAxios(env) {
+  const cfg = ENVIRONMENTS[env];
+  if (!cfg || !cfg.apiKey) {
+    const msg = `[ASAAS] ❌ API key ausente para ambiente "${env}". Verifique variáveis ASAAS_API_KEY_${env.toUpperCase()}.`;
+    console.error(msg);
+    const err = new Error(msg);
+    err.name = 'ConfigError';
+    throw err;
   }
-};
 
-const createPayment = async (order) => {
-  try {
-    const response = await api.post('/payments', order);
-    return response.data;
-  } catch (error) {
-    console.error('Erro ao criar pagamento no Asaas:', error.response?.data || error.message);
-    const asaasError = error.response?.data?.errors?.[0]?.description || 'Erro desconhecido do gateway.';
-    throw new Error(`Falha ao criar cobrança: ${asaasError}`);
-  }
-};
+  return axios.create({
+    baseURL: cfg.baseURL,
+    headers: {
+      'Content-Type': 'application/json',
+      'access_token': cfg.apiKey,
+    },
+    timeout: 20000,
+  });
+}
 
-const getPayment = async (paymentId) => {
-  try {
-    const response = await api.get(`/payments/${paymentId}`);
-    return response.data;
-  } catch (error) {
-    console.error('Erro ao obter pagamento no Asaas:', error.response?.data || error.message);
-    const asaasError = error.response?.data?.errors?.[0]?.description || 'Erro desconhecido ao buscar pagamento.';
-    throw new Error(`Falha ao obter pagamento: ${asaasError}`);
-  }
-};
+function asaasErrorFromAxios(error) {
+  const first = error?.response?.data?.errors?.[0] || {};
+  const err = new Error(first.description || error.message || 'Erro no gateway');
+  err.name = 'AsaasError';
+  err.code = first.code || null;
+  err.status = error?.response?.status || null;
+  err.raw = error?.response?.data || null;
+  // MUITO IMPORTANTE: preserva response para o caller
+  err.response = error?.response;
+  return err;
+}
 
-const getPixQrCode = async (paymentId) => {
+/** Busca cliente existente por CPF ou por email. Retorna ID ou null. */
+async function findExistingCustomer(api, { cpf, email }) {
   try {
-    const response = await api.get(`/payments/${paymentId}/pixQrCode`);
-    return response.data;
-  } catch (error) {
-    console.error('Erro ao obter QRCode PIX no Asaas:', error.response?.data || error.message);
-    const asaasError = error.response?.data?.errors?.[0]?.description || 'Erro desconhecido ao obter QRCode PIX.';
-    throw new Error(`Falha ao obter QRCode PIX: ${asaasError}`);
-  }
-};
+    if (cpf) {
+      const { data } = await api.get('/customers', { params: { cpfCnpj: cpf } });
+      if (Array.isArray(data?.data) && data.data.length > 0) return data.data[0].id || null;
+    }
+  } catch (_) { /* ignora */ }
+  try {
+    if (email) {
+      const { data } = await api.get('/customers', { params: { email } });
+      if (Array.isArray(data?.data) && data.data.length > 0) return data.data[0].id || null;
+    }
+  } catch (_) { /* ignora */ }
+  return null;
+}
+
+/**
+ * Retorna um client do Asaas para o ambiente escolhido.
+ * Uso típico no route: const asaas = getAsaasClient(req);
+ */
+function getAsaasClient(reqOrEnv) {
+  const env = typeof reqOrEnv === 'string' ? reqOrEnv : resolveEnvFromReq(reqOrEnv);
+  const api = buildAxios(env);
+
+  return {
+    env,
+
+    /** Idempotente: se já existir cliente com mesmo CPF/email, reaproveita. */
+    async createCustomer(user) {
+      try {
+        const cpf = String(user.cpf || '').replace(/\D/g, '') || undefined;
+        const email = user.email || undefined;
+
+        const existingId = await findExistingCustomer(api, { cpf, email });
+        if (existingId) return existingId;
+
+        const payload = {
+          name: user.nomeCompleto || user.name || user.fullName || 'Cliente',
+          email: email,
+          cpfCnpj: cpf,
+          mobilePhone: String(user.celular || '').replace(/\D/g, '') || undefined,
+          address: user.logradouro || undefined,
+          addressNumber: user.numero || undefined,
+          complement: user.complemento || undefined,
+          province: user.bairro || undefined,
+          postalCode: String(user.cep || '').replace(/\D/g, '') || undefined,
+        };
+
+        const { data } = await api.post('/customers', payload);
+        return data.id;
+      } catch (e) {
+        console.error('[ASAAS] Erro ao criar cliente:', e.response?.data || e.message);
+        throw asaasErrorFromAxios(e);
+      }
+    },
+
+    async createPayment(order) {
+      try {
+        const { data } = await api.post('/payments', order);
+        return data;
+      } catch (e) {
+        console.error('[ASAAS] Erro ao criar pagamento:', e.response?.data || e.message);
+        throw asaasErrorFromAxios(e);
+      }
+    },
+
+    async getPayment(paymentId) {
+      try {
+        const { data } = await api.get(`/payments/${paymentId}`);
+        return data;
+      } catch (e) {
+        console.error('[ASAAS] Erro ao obter pagamento:', e.response?.data || e.message);
+        throw asaasErrorFromAxios(e);
+      }
+    },
+
+    async getPixQrCode(paymentId) {
+      try {
+        const { data } = await api.get(`/payments/${paymentId}/pixQrCode`);
+        return data;
+      } catch (e) {
+        console.error('[ASAAS] Erro ao obter PIX QRCode:', e.response?.data || e.message);
+        throw asaasErrorFromAxios(e);
+      }
+    },
+  };
+}
 
 module.exports = {
-  createCustomer,
-  createPayment,
-  getPayment,
-  getPixQrCode,
+  getAsaasClient,
+  resolveEnvFromReq,
 };

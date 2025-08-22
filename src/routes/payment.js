@@ -1,15 +1,15 @@
+// routes/payment.js
 const express = require('express');
 const { body, validationResult } = require('express-validator');
 const { Op } = require('sequelize');
 const sequelize = require('../db/connection');
-const asaas = require('../services/asaas');
+const { getAsaasClient, resolveEnvFromReq } = require('../services/asaas');
 const User = require('../models/user');
 const Transaction = require('../models/Transaction');
 const Coupon = require('../models/Coupon');
 const authMiddleware = require('../middleware/authMiddleware');
 
 const router = express.Router();
-
 const MIN_CHARGE = 0.01;
 
 const getCreditPrice = (quantity) => {
@@ -31,6 +31,7 @@ router.post(
     body('quantity').isInt({ min: 1 }).withMessage('A quantidade deve ser um número inteiro positivo.'),
     body('paymentMethod').isIn(['pix', 'card']).withMessage('Método de pagamento inválido.'),
     body('couponCode').optional().isString().trim(),
+    body('card').optional().isObject(),
   ],
   async (req, res) => {
     const errors = validationResult(req);
@@ -39,10 +40,10 @@ router.post(
     const { quantity, paymentMethod, card, couponCode } = req.body;
     const user = req.user;
 
-    // A transação do Sequelize garante que todas as operações com o banco de dados
-    // sejam concluídas com sucesso ou nenhuma delas é aplicada.
-    const dbTransaction = await sequelize.transaction();
+    const env = resolveEnvFromReq(req); // ← escolhe sandbox/prod automaticamente
+    const asaas = getAsaasClient(env);
 
+    const dbTransaction = await sequelize.transaction();
     try {
       if (process.env.APP_REQUIRE_ADDRESS === 'true' && (!user.cep || !user.numero)) {
         await dbTransaction.rollback();
@@ -64,29 +65,31 @@ router.post(
             isActive: true,
             expiresAt: { [Op.or]: { [Op.eq]: null, [Op.gt]: new Date() } },
           },
+          transaction: dbTransaction,
+          lock: true,
         });
+
         if (!coupon) {
-            await dbTransaction.rollback();
-            return res.status(404).json({ error: 'Cupom inválido ou expirado.' });
+          await dbTransaction.rollback();
+          return res.status(404).json({ error: 'Cupom inválido ou expirado.' });
         }
         if (coupon.maxUses !== null && coupon.usesCount >= coupon.maxUses) {
-            await dbTransaction.rollback();
-            return res.status(400).json({ error: 'Este cupom atingiu o limite de usos.' });
+          await dbTransaction.rollback();
+          return res.status(400).json({ error: 'Este cupom atingiu o limite de usos.' });
         }
 
         appliedCoupon = coupon;
         if (coupon.discountType === 'percentage') {
-          const discount = (finalValue * parseFloat(coupon.value)) / 100;
-          discountValue = parseFloat(discount.toFixed(2));
+          discountValue = parseFloat(((finalValue * parseFloat(coupon.value)) / 100).toFixed(2));
         } else {
-          const discount = parseFloat(coupon.value);
-          discountValue = parseFloat(discount.toFixed(2));
+          discountValue = parseFloat(parseFloat(coupon.value).toFixed(2));
         }
         finalValue = parseFloat((finalValue - discountValue).toFixed(2));
         if (finalValue < MIN_CHARGE) finalValue = MIN_CHARGE;
       }
 
-      let customerId = user.asaasCustomerId;
+      // Obter/registrar cliente (idempotente)
+      let customerId = user.asaasCustomerId || null;
       if (!customerId) {
         customerId = await asaas.createCustomer(user);
         user.asaasCustomerId = customerId;
@@ -102,7 +105,7 @@ router.post(
         dueDate: dueDate.toISOString().split('T')[0],
         value: finalValue,
         description,
-        externalReference: `USER:${user.id}|QTY:${quantity}|COUPON:${appliedCoupon ? appliedCoupon.code : '-'}`,
+        externalReference: `ENV:${env}|USER:${user.id}|QTY:${quantity}|COUPON:${appliedCoupon ? appliedCoupon.code : '-'}`,
         creditCard: paymentMethod === 'card' ? {
           holderName: card?.holderName,
           number: String(card?.number || '').replace(/\s/g, ''),
@@ -120,45 +123,37 @@ router.post(
         } : undefined,
       };
 
-      // =================== INÍCIO DA CORREÇÃO ===================
       let payment;
       try {
-        // Primeira tentativa para criar o pagamento.
         payment = await asaas.createPayment(orderPayload);
       } catch (error) {
-        const asaasErrorCode = error.response?.data?.errors?.[0]?.code;
+        // ✅ AGORA conseguimos identificar o erro do Asaas
+        const isAsaasInvalidCustomer = error?.name === 'AsaasError' && error?.code === 'invalid_customer';
 
-        // Se o erro for 'invalid_customer', o ID no banco está obsoleto.
-        if (asaasErrorCode === 'invalid_customer') {
-          console.warn(`[ASAAS] ID de cliente obsoleto para usuário ${user.id}. Recriando...`);
+        if (isAsaasInvalidCustomer) {
+          console.warn(`[ASAAS] ID de cliente inválido/obsoleto (env=${env}) para usuário ${user.id}. Recriando...`);
           try {
-            // Cria um novo cliente no Asaas.
+            // Cria/recupera cliente novamente (idempotente)
             const newCustomerId = await asaas.createCustomer(user);
             user.asaasCustomerId = newCustomerId;
             await user.save({ transaction: dbTransaction });
 
-            // Atualiza o pedido com o novo ID de cliente.
             orderPayload.customer = newCustomerId;
-
-            // Tenta criar o pagamento novamente.
             payment = await asaas.createPayment(orderPayload);
-            console.log(`[ASAAS] Cliente recriado e pagamento bem-sucedido para usuário ${user.id}.`);
+            console.log(`[ASAAS] Cliente refeito e pagamento criado (env=${env}) para usuário ${user.id}.`);
           } catch (retryError) {
-            // Se a segunda tentativa falhar, desfaz a transação e retorna o erro.
             await dbTransaction.rollback();
-            console.error('Erro na nova tentativa de pagamento:', retryError.response?.data || retryError.message);
-            const retryAsaasError = retryError.response?.data?.errors?.[0]?.description || 'Falha na segunda tentativa de cobrança.';
-            return res.status(500).json({ error: `Falha ao criar cobrança: ${retryAsaasError}` });
+            const msg = retryError?.message || 'Falha na segunda tentativa de cobrança.';
+            console.error('[ASAAS] Nova tentativa falhou:', retryError?.raw || retryError);
+            return res.status(500).json({ error: `Falha ao criar cobrança: ${msg}` });
           }
         } else {
-          // Se for outro tipo de erro, desfaz a transação e retorna o erro original.
           await dbTransaction.rollback();
-          console.error('Erro ao criar pagamento no Asaas:', error.response?.data || error.message);
-          const asaasError = error.response?.data?.errors?.[0]?.description || 'Erro desconhecido do gateway.';
-          return res.status(500).json({ error: `Falha ao criar cobrança: ${asaasError}` });
+          const msg = error?.message || 'Erro desconhecido do gateway.';
+          console.error('[ASAAS] Erro ao criar pagamento:', error?.raw || msg);
+          return res.status(500).json({ error: `Falha ao criar cobrança: ${msg}` });
         }
       }
-      // =================== FIM DA CORREÇÃO ===================
 
       const isConfirmed = payment.status === 'CONFIRMED' || payment.status === 'RECEIVED';
       const paidAt = isConfirmed ? (parseGatewayDate(payment.confirmedDate) || parseGatewayDate(payment.paymentDate) || new Date()) : null;
@@ -188,10 +183,9 @@ router.post(
         updatedCredits += quantity;
       }
 
-      // Se tudo deu certo, confirma as operações no banco de dados.
       await dbTransaction.commit();
 
-      let responsePayload = {
+      const responsePayload = {
         paymentId: payment.id,
         status: payment.status,
         value: finalValue,
@@ -210,20 +204,18 @@ router.post(
             expiresAt: qr.expirationDate || payment.dueDate || null,
           };
         } catch (qrErr) {
-          console.error('Falha ao obter QRCode PIX:', qrErr.message);
+          console.error('[ASAAS] Falha ao obter QRCode PIX:', qrErr?.message);
         }
       }
 
       return res.status(201).json(responsePayload);
     } catch (error) {
-      // Se ocorrer qualquer erro não tratado, desfaz a transação.
       await dbTransaction.rollback();
-      console.error('Erro geral ao criar ordem de pagamento:', error.message);
+      console.error('Erro geral ao criar ordem de pagamento:', error?.message || error);
       return res.status(500).json({ error: 'Ocorreu um erro inesperado no servidor.' });
     }
   }
 );
-
 
 // ====== STATUS (fallback/polling) ======
 router.get('/status/:paymentId', authMiddleware, async (req, res) => {
@@ -243,6 +235,9 @@ router.get('/status/:paymentId', authMiddleware, async (req, res) => {
         paidAt: txn.paidAt ? new Date(txn.paidAt).toISOString() : null,
       });
     }
+
+    const env = resolveEnvFromReq(req);
+    const asaas = getAsaasClient(env);
 
     const p = await asaas.getPayment(paymentId);
     const isConfirmed = p.status === 'CONFIRMED' || p.status === 'RECEIVED';
@@ -290,7 +285,7 @@ router.get('/status/:paymentId', authMiddleware, async (req, res) => {
       paidAt: txn.paidAt ? new Date(txn.paidAt).toISOString() : null,
     });
   } catch (err) {
-    console.error('[STATUS] Falha ao consultar status:', err.message);
+    console.error('[STATUS] Falha ao consultar status:', err?.message || err);
     return res.json({ status: 'PENDING' });
   }
 });
@@ -300,7 +295,13 @@ router.post('/webhook', async (req, res) => {
   const { event, payment } = req.body || {};
   const webhookToken = req.headers['asaas-webhook-token'];
 
-  if (webhookToken !== process.env.ASAAS_WEBHOOK_TOKEN) {
+  const validTokens = new Set([
+    process.env.ASAAS_WEBHOOK_TOKEN,
+    process.env.ASAAS_WEBHOOK_TOKEN_PRODUCTION,
+    process.env.ASAAS_WEBHOOK_TOKEN_SANDBOX,
+  ].filter(Boolean));
+
+  if (!validTokens.has(webhookToken)) {
     return res.status(403).send('Acesso negado.');
   }
 
@@ -348,7 +349,6 @@ router.post('/webhook', async (req, res) => {
 
         await txn.save({ transaction: t });
 
-        // Emite para a SALA do pagamento (não depende de socketId)
         const userAfter = await User.findByPk(txn.userId, { transaction: t });
         req.io.to(`pay:${payment.id}`).emit('payment_confirmed', {
           paymentId: payment.id,
@@ -374,7 +374,7 @@ router.post('/webhook', async (req, res) => {
 
     return res.sendStatus(200);
   } catch (err) {
-    console.error('[WEBHOOK] Erro ao processar webhook:', err.message);
+    console.error('[WEBHOOK] Erro ao processar webhook:', err?.message || err);
     return res.sendStatus(200);
   }
 });
