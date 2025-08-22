@@ -16,10 +16,18 @@ const User = require('./models/user');
 const Transaction = require('./models/Transaction.js');
 const Coupon = require('./models/Coupon');
 
+// ===== INÍCIO DA CORREÇÃO: DEFINIÇÃO DAS ASSOCIAÇÕES =====
+// É crucial definir como os modelos se relacionam antes de usá-los.
+// Transaction.belongsTo(User) cria a chave estrangeira 'userId' na tabela de transações.
+Transaction.belongsTo(User, { foreignKey: 'userId', as: 'user' });
+User.hasMany(Transaction, { foreignKey: 'userId' });
+// =================== FIM DA CORREÇÃO ===================
+
 const authRoutes = require('./routes/auth');
 const paymentRoutes = require('./routes/payment');
 const userRoutes = require('./routes/user');
 const couponRoutes = require('./routes/coupons');
+const transactionRoutes = require('./routes/transactions'); // Rota que estava causando o erro
 
 const app = express();
 const httpServer = http.createServer(app);
@@ -101,6 +109,7 @@ app.use('/api/auth', authRoutes);
 app.use('/api/payment', paymentRoutes);
 app.use('/api/user', userRoutes);
 app.use('/api/coupons', couponRoutes);
+app.use('/api/transactions', transactionRoutes);
 
 app.get('/api/me', async (req, res) => {
   try {
