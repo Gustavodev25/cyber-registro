@@ -1,8 +1,9 @@
 const { Sequelize } = require('sequelize');
-const dotenv = require('dotenv');
 
-// Carrega as variáveis de ambiente do arquivo .env
-dotenv.config();
+// =================== INÍCIO DA CORREÇÃO ===================
+// A importação e configuração do 'dotenv' também foram removidas deste arquivo
+// para seguir a abordagem de configuração centralizada no 'server.js'.
+// =================== FIM DA CORREÇÃO ===================
 
 // Pega as credenciais do banco de dados a partir das variáveis de ambiente
 const {

@@ -4,30 +4,40 @@ const cors = require('cors');
 const helmet = require('helmet');
 const jwt = require('jsonwebtoken');
 const dotenv = require('dotenv');
+const path = require('path'); // Módulo 'path' importado para resolver caminhos
+
 // A linha 'const ngrok = require('ngrok');' foi REMOVIDA daqui.
 
 const http = require('http');
 const { Server } = require('socket.io');
 
-dotenv.config();
+// =================== INÍCIO DA CORREÇÃO ===================
+// Lógica centralizada para carregar o arquivo .env correto.
+// Isso garante que as variáveis de ambiente de produção sejam carregadas
+// apenas quando NODE_ENV for 'production'.
+if (process.env.NODE_ENV === 'production') {
+  console.log('[ENV] Carregando variáveis de ambiente de produção...');
+  dotenv.config({ path: path.join(__dirname, '.env.production') });
+} else {
+  console.log('[ENV] Carregando variáveis de ambiente de desenvolvimento...');
+  dotenv.config(); // Carrega o arquivo .env padrão
+}
+// =================== FIM DA CORREÇÃO ===================
 
 const sequelize = require('./db/connection');
 const User = require('./models/user');
 const Transaction = require('./models/Transaction.js');
 const Coupon = require('./models/Coupon');
 
-// ===== INÍCIO DA CORREÇÃO: DEFINIÇÃO DAS ASSOCIAÇÕES =====
-// É crucial definir como os modelos se relacionam antes de usá-los.
-// Transaction.belongsTo(User) cria a chave estrangeira 'userId' na tabela de transações.
+// Definição das associações entre os modelos
 Transaction.belongsTo(User, { foreignKey: 'userId', as: 'user' });
 User.hasMany(Transaction, { foreignKey: 'userId' });
-// =================== FIM DA CORREÇÃO ===================
 
 const authRoutes = require('./routes/auth');
 const paymentRoutes = require('./routes/payment');
 const userRoutes = require('./routes/user');
 const couponRoutes = require('./routes/coupons');
-const transactionRoutes = require('./routes/transactions'); // Rota que estava causando o erro
+const transactionRoutes = require('./routes/transactions');
 
 const app = express();
 const httpServer = http.createServer(app);
@@ -64,7 +74,7 @@ app.set('trust proxy', 1);
 app.use(express.json({ limit: '1mb' }));
 app.use(express.urlencoded({ extended: true }));
 
-// ===== CORS aprimorado: permite localhost, domínio sem e com www, e extras via env =====
+// Configuração de CORS aprimorada
 const DEFAULT_ALLOWED = [
   'http://localhost:8080',
   'http://127.0.0.1:8080',
@@ -83,9 +93,9 @@ const ALLOWED_ORIGINS = Array.from(new Set([...DEFAULT_ALLOWED, ...extra]));
 app.use(
   cors({
     origin(origin, cb) {
-      // permite ferramentas/health sem header Origin
-      if (!origin) return cb(null, true);
-      if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
+      if (!origin || ALLOWED_ORIGINS.includes(origin)) {
+        return cb(null, true);
+      }
       return cb(new Error(`CORS bloqueado para origem: ${origin}`));
     },
     credentials: true,
@@ -94,10 +104,9 @@ app.use(
     maxAge: 86400,
   })
 );
-// pré-flight global
 app.options('*', cors());
 
-// injeta io no req
+// Injeta o 'io' no objeto de requisição
 app.use((req, res, next) => {
   req.io = io;
   next();
@@ -137,8 +146,6 @@ async function start() {
       console.log(`[API] ✅ Backend: Iniciado com sucesso na porta ${PORT}`);
 
       if (NODE_ENV === 'development') {
-        // --- MODIFICAÇÃO PRINCIPAL ---
-        // O ngrok agora é carregado APENAS em ambiente de desenvolvimento.
         const ngrok = require('ngrok');
         try {
           const url = await ngrok.connect({

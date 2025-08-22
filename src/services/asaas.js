@@ -1,10 +1,19 @@
 const axios = require('axios');
-const dotenv = require('dotenv');
 
-dotenv.config();
+// =================== INÍCIO DA CORREÇÃO ===================
+// A importação e configuração do 'dotenv' foram removidas deste arquivo.
+// A configuração agora é centralizada no 'server.js' para evitar
+// inconsistências e garantir que as variáveis corretas sejam carregadas.
+// =================== FIM DA CORREÇÃO ===================
 
 const ASAAS_API_KEY = process.env.ASAAS_API_KEY;
 const ASAAS_ENV = process.env.ASAAS_ENV || 'sandbox';
+
+// Adicionada uma verificação para garantir que a chave da API foi carregada
+if (!ASAAS_API_KEY) {
+  console.error('[ASAAS] ❌ ERRO CRÍTICO: A variável de ambiente ASAAS_API_KEY não foi definida.');
+  throw new Error('A chave da API do Asaas não está configurada.');
+}
 
 const environments = {
   sandbox: 'https://api-sandbox.asaas.com/v3',
