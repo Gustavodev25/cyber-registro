@@ -4,23 +4,18 @@ const cors = require('cors');
 const helmet = require('helmet');
 const jwt = require('jsonwebtoken');
 const dotenv = require('dotenv');
-const path = require('path'); // Módulo 'path' importado para resolver caminhos
-
 // A linha 'const ngrok = require('ngrok');' foi REMOVIDA daqui.
 
 const http = require('http');
 const { Server } = require('socket.io');
 
 // =================== INÍCIO DA CORREÇÃO ===================
-// Lógica centralizada para carregar o arquivo .env correto.
-// Isso garante que as variáveis de ambiente de produção sejam carregadas
-// apenas quando NODE_ENV for 'production'.
-if (process.env.NODE_ENV === 'production') {
-  console.log('[ENV] Carregando variáveis de ambiente de produção...');
-  dotenv.config({ path: path.join(__dirname, '.env.production') });
-} else {
+// Carrega as variáveis do arquivo .env APENAS em ambiente de desenvolvimento.
+// Em produção (como no Render), as variáveis devem ser configuradas
+// diretamente no painel do provedor de hospedagem.
+if (process.env.NODE_ENV !== 'production') {
   console.log('[ENV] Carregando variáveis de ambiente de desenvolvimento...');
-  dotenv.config(); // Carrega o arquivo .env padrão
+  dotenv.config();
 }
 // =================== FIM DA CORREÇÃO ===================
 
