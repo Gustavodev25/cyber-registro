@@ -39,8 +39,13 @@ router.post(
     const { quantity, paymentMethod, card, couponCode } = req.body;
     const user = req.user;
 
+    // A transação do Sequelize garante que todas as operações com o banco de dados
+    // sejam concluídas com sucesso ou nenhuma delas é aplicada.
+    const dbTransaction = await sequelize.transaction();
+
     try {
       if (process.env.APP_REQUIRE_ADDRESS === 'true' && (!user.cep || !user.numero)) {
+        await dbTransaction.rollback();
         return res.status(400).json({ error: 'É necessário completar seu endereço no perfil antes de comprar.' });
       }
 
@@ -60,22 +65,24 @@ router.post(
             expiresAt: { [Op.or]: { [Op.eq]: null, [Op.gt]: new Date() } },
           },
         });
-        if (!coupon) return res.status(404).json({ error: 'Cupom inválido ou expirado.' });
+        if (!coupon) {
+            await dbTransaction.rollback();
+            return res.status(404).json({ error: 'Cupom inválido ou expirado.' });
+        }
         if (coupon.maxUses !== null && coupon.usesCount >= coupon.maxUses) {
-          return res.status(400).json({ error: 'Este cupom atingiu o limite de usos.' });
+            await dbTransaction.rollback();
+            return res.status(400).json({ error: 'Este cupom atingiu o limite de usos.' });
         }
 
         appliedCoupon = coupon;
         if (coupon.discountType === 'percentage') {
           const discount = (finalValue * parseFloat(coupon.value)) / 100;
           discountValue = parseFloat(discount.toFixed(2));
-          finalValue = parseFloat((finalValue - discount).toFixed(2));
         } else {
           const discount = parseFloat(coupon.value);
           discountValue = parseFloat(discount.toFixed(2));
-          finalValue = parseFloat((finalValue - discount).toFixed(2));
         }
-
+        finalValue = parseFloat((finalValue - discountValue).toFixed(2));
         if (finalValue < MIN_CHARGE) finalValue = MIN_CHARGE;
       }
 
@@ -83,16 +90,15 @@ router.post(
       if (!customerId) {
         customerId = await asaas.createCustomer(user);
         user.asaasCustomerId = customerId;
-        await user.save();
+        await user.save({ transaction: dbTransaction });
       }
 
-      const billingType = paymentMethod === 'pix' ? 'PIX' : 'CREDIT_CARD';
       const dueDate = new Date();
       dueDate.setDate(dueDate.getDate() + 1);
 
-      const order = {
+      const orderPayload = {
         customer: customerId,
-        billingType,
+        billingType: paymentMethod === 'pix' ? 'PIX' : 'CREDIT_CARD',
         dueDate: dueDate.toISOString().split('T')[0],
         value: finalValue,
         description,
@@ -114,56 +120,76 @@ router.post(
         } : undefined,
       };
 
-      const payment = await asaas.createPayment(order);
-      const isConfirmed = payment.status === 'CONFIRMED' || payment.status === 'RECEIVED';
+      // =================== INÍCIO DA CORREÇÃO ===================
+      let payment;
+      try {
+        // Primeira tentativa para criar o pagamento.
+        payment = await asaas.createPayment(orderPayload);
+      } catch (error) {
+        const asaasErrorCode = error.response?.data?.errors?.[0]?.code;
 
-      let paymentDetails = null;
-      if (isConfirmed) {
-        try { paymentDetails = await asaas.getPayment(payment.id); } catch { paymentDetails = null; }
+        // Se o erro for 'invalid_customer', o ID no banco está obsoleto.
+        if (asaasErrorCode === 'invalid_customer') {
+          console.warn(`[ASAAS] ID de cliente obsoleto para usuário ${user.id}. Recriando...`);
+          try {
+            // Cria um novo cliente no Asaas.
+            const newCustomerId = await asaas.createCustomer(user);
+            user.asaasCustomerId = newCustomerId;
+            await user.save({ transaction: dbTransaction });
+
+            // Atualiza o pedido com o novo ID de cliente.
+            orderPayload.customer = newCustomerId;
+
+            // Tenta criar o pagamento novamente.
+            payment = await asaas.createPayment(orderPayload);
+            console.log(`[ASAAS] Cliente recriado e pagamento bem-sucedido para usuário ${user.id}.`);
+          } catch (retryError) {
+            // Se a segunda tentativa falhar, desfaz a transação e retorna o erro.
+            await dbTransaction.rollback();
+            console.error('Erro na nova tentativa de pagamento:', retryError.response?.data || retryError.message);
+            const retryAsaasError = retryError.response?.data?.errors?.[0]?.description || 'Falha na segunda tentativa de cobrança.';
+            return res.status(500).json({ error: `Falha ao criar cobrança: ${retryAsaasError}` });
+          }
+        } else {
+          // Se for outro tipo de erro, desfaz a transação e retorna o erro original.
+          await dbTransaction.rollback();
+          console.error('Erro ao criar pagamento no Asaas:', error.response?.data || error.message);
+          const asaasError = error.response?.data?.errors?.[0]?.description || 'Erro desconhecido do gateway.';
+          return res.status(500).json({ error: `Falha ao criar cobrança: ${asaasError}` });
+        }
       }
+      // =================== FIM DA CORREÇÃO ===================
 
-      const asaasPaymentDate =
-        parseGatewayDate(paymentDetails?.paymentDate) ||
-        parseGatewayDate(payment?.paymentDate) ||
-        null;
+      const isConfirmed = payment.status === 'CONFIRMED' || payment.status === 'RECEIVED';
+      const paidAt = isConfirmed ? (parseGatewayDate(payment.confirmedDate) || parseGatewayDate(payment.paymentDate) || new Date()) : null;
 
-      const asaasConfirmedDate =
-        parseGatewayDate(paymentDetails?.confirmedDate) ||
-        parseGatewayDate(payment?.confirmedDate) ||
-        null;
-
-      const paidAt = isConfirmed ? (asaasConfirmedDate || asaasPaymentDate || new Date()) : null;
+      await Transaction.create({
+        userId: user.id,
+        asaasPaymentId: payment.id,
+        description,
+        quantity,
+        unitPrice,
+        totalAmount,
+        value: finalValue,
+        discount: discountValue,
+        couponCode: appliedCoupon ? appliedCoupon.code : null,
+        status: isConfirmed ? 'CONFIRMED' : 'PENDING',
+        paymentMethod,
+        paidAt,
+        asaasStatus: payment.status || null,
+        asaasPaymentDate: parseGatewayDate(payment.paymentDate),
+        asaasConfirmedDate: parseGatewayDate(payment.confirmedDate),
+      }, { transaction: dbTransaction });
 
       let updatedCredits = user.credits;
+      if (isConfirmed) {
+        await user.increment('credits', { by: quantity, transaction: dbTransaction });
+        if (appliedCoupon) await appliedCoupon.increment('usesCount', { by: 1, transaction: dbTransaction });
+        updatedCredits += quantity;
+      }
 
-      await sequelize.transaction(async (t) => {
-        await Transaction.create({
-          userId: user.id,
-          asaasPaymentId: payment.id,
-          description,
-          quantity,
-          unitPrice,
-          totalAmount,
-          value: finalValue,
-          discount: discountValue,
-          couponCode: appliedCoupon ? appliedCoupon.code : null,
-          status: isConfirmed ? 'CONFIRMED' : 'PENDING',
-          paymentMethod,
-          paidAt,
-          asaasStatus: payment.status || null,
-          asaasPaymentDate,
-          asaasConfirmedDate,
-        }, { transaction: t });
-
-        if (isConfirmed) {
-          await user.increment('credits', { by: quantity, transaction: t });
-          if (appliedCoupon) await appliedCoupon.increment('usesCount', { by: 1, transaction: t });
-          // **INÍCIO DA CORREÇÃO**
-          // Recalcula o valor para garantir consistência
-          updatedCredits = user.credits + quantity;
-          // **FIM DA CORREÇÃO**
-        }
-      });
+      // Se tudo deu certo, confirma as operações no banco de dados.
+      await dbTransaction.commit();
 
       let responsePayload = {
         paymentId: payment.id,
@@ -172,42 +198,32 @@ router.post(
         discount: discountValue,
         invoiceUrl: payment.invoiceUrl || null,
         paidAt: paidAt ? new Date(paidAt).toISOString() : null,
+        updatedCredits: isConfirmed ? updatedCredits : undefined,
       };
 
-      // **INÍCIO DA CORREÇÃO**
-      // Se o pagamento foi confirmado imediatamente, anexa o novo saldo de créditos à resposta.
-      if (isConfirmed) {
-        responsePayload.updatedCredits = updatedCredits;
-      }
-      // **FIM DA CORREÇÃO**
-
-      if (billingType === 'PIX') {
+      if (payment.billingType === 'PIX' && !isConfirmed) {
         try {
           const qr = await asaas.getPixQrCode(payment.id);
           responsePayload.pix = {
             imageSrc: `data:image/png;base64,${qr.encodedImage}`,
             copyAndPaste: qr.payload,
             expiresAt: qr.expirationDate || payment.dueDate || null,
-            invoiceUrl: payment.invoiceUrl || null,
           };
         } catch (qrErr) {
           console.error('Falha ao obter QRCode PIX:', qrErr.message);
-          responsePayload.pix = {
-            imageSrc: null,
-            copyAndPaste: null,
-            expiresAt: payment.dueDate || null,
-            invoiceUrl: payment.invoiceUrl || null,
-          };
         }
       }
 
       return res.status(201).json(responsePayload);
     } catch (error) {
-      console.error('Erro ao criar ordem de pagamento:', error.response?.data || error.message);
-      return res.status(500).json({ error: 'Falha ao criar cobrança.' });
+      // Se ocorrer qualquer erro não tratado, desfaz a transação.
+      await dbTransaction.rollback();
+      console.error('Erro geral ao criar ordem de pagamento:', error.message);
+      return res.status(500).json({ error: 'Ocorreu um erro inesperado no servidor.' });
     }
   }
 );
+
 
 // ====== STATUS (fallback/polling) ======
 router.get('/status/:paymentId', authMiddleware, async (req, res) => {
